@@ -1,5 +1,5 @@
 # ------------------------------------------------------------
-# One-Stop pilot: integrated multimodal strategies
+# One-Stop pilot: integrated multimodal strategies with CIs
 # ------------------------------------------------------------
 import random
 from itertools import product
@@ -13,7 +13,7 @@ from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import StandardScaler
 
 # ---------- 1. File path & columns ----------
-IA_FILE = "ia_Paragraph_ordinary.csv"  # path to the OneStop IA file
+IA_FILE = "ia_Paragraph_ordinary.csv"
 eye_cols = [
     "IA_FIRST_FIXATION_DURATION",
     "IA_SECOND_FIXATION_DURATION",
@@ -41,17 +41,20 @@ use_cols = group_cols + eye_cols + text_cols + answer_cols
 print("Aggregating IA file → features …")
 chunks = pd.read_csv(IA_FILE, usecols=use_cols, sep=",", chunksize=500_000)
 records = []
+
 for chunk in chunks:
     # label
     chunk["correct"] = (
         chunk["selected_answer_position"] == chunk["correct_answer_position"]
     ).astype(int)
     chunk.drop(columns=answer_cols, inplace=True)
+
     # numeric coercion
     chunk[eye_cols + text_cols] = chunk[eye_cols + text_cols].apply(
         pd.to_numeric, errors="coerce"
     )
-    # log-transform skewed
+
+    # log-transform skewed features
     for col in [
         "IA_DWELL_TIME",
         "IA_FIRST_RUN_DWELL_TIME",
@@ -59,7 +62,8 @@ for chunk in chunks:
         "IA_FIRST_FIXATION_DURATION",
     ]:
         chunk[col] = np.log1p(chunk[col])
-    # rate features
+
+    # rate-normalized gaze features
     chunk["words_in_para"] = chunk.groupby(group_cols)[
         "word_length_no_punctuation"
     ].transform("count")
@@ -67,7 +71,8 @@ for chunk in chunks:
         chunk["IA_REGRESSION_IN_COUNT"] + chunk["IA_REGRESSION_OUT_COUNT"]
     ) / chunk["words_in_para"]
     chunk["fixations_per_word"] = chunk["IA_FIXATION_COUNT"] / chunk["words_in_para"]
-    # aggregate
+
+    # aggregate per paragraph
     cols_all = (
         eye_cols
         + ["regressions_per_word", "fixations_per_word"]
@@ -76,6 +81,7 @@ for chunk in chunks:
     )
     grp = chunk.groupby(group_cols)[cols_all].median().reset_index()
     records.append(grp)
+
 df = pd.concat(records, ignore_index=True)
 print(f"Data shape: {df.shape}")
 
@@ -94,15 +100,16 @@ X_both = (
     .replace([np.inf, -np.inf], np.nan)
     .fillna(0)
 )
-y = df["correct"].round().astype(int)
+y = df["correct"].astype(int)
 grp = df["participant_id"]
 
 # ---------- 5. CV splitter ----------
 cv = GroupKFold(n_splits=5)
 
 
-# ---------- 6. Unimodal logistic baselines ----------
-def quick_auc(Xsub):
+# ---------- 6. Unimodal logistic baselines with CIs ----------
+def quick_auc_folds(Xsub):
+    """Return list of per-fold AUCs."""
     aucs = []
     for tr, te in cv.split(Xsub, y, grp):
         scaler = StandardScaler()
@@ -111,13 +118,20 @@ def quick_auc(Xsub):
         clf = LogisticRegression(max_iter=5000, solver="lbfgs")
         clf.fit(Xtr, y.iloc[tr])
         aucs.append(roc_auc_score(y.iloc[te], clf.predict_proba(Xte)[:, 1]))
-    return np.mean(aucs)
+    return aucs
 
 
-print("Eye-only  AUC:", round(quick_auc(X_eye), 3))
-print("Text-only AUC:", round(quick_auc(X_text), 3))
+eye_folds = quick_auc_folds(X_eye)
+eye_mean = np.mean(eye_folds)
+eye_ci = np.percentile(eye_folds, [2.5, 97.5])
+print(f"Eye-only  AUC: {eye_mean:.3f} (95% CI: {eye_ci[0]:.3f}–{eye_ci[1]:.3f})")
 
-# ---------- 7. LightGBM multimodal CV ----------
+text_folds = quick_auc_folds(X_text)
+text_mean = np.mean(text_folds)
+text_ci = np.percentile(text_folds, [2.5, 97.5])
+print(f"Text-only AUC: {text_mean:.3f} (95% CI: {text_ci[0]:.3f}–{text_ci[1]:.3f})")
+
+# ---------- 7. LightGBM multimodal CV with CIs ----------
 lgb_params = dict(
     objective="binary",
     metric="auc",
@@ -131,33 +145,41 @@ lgb_params = dict(
     n_jobs=-1,
     verbose=-1,
 )
-aucs, feat_imp = [], np.zeros(X_both.shape[1])
+mod_folds, feat_imp = [], np.zeros(X_both.shape[1])
 print("Running LightGBM CV …")
 for tr, te in cv.split(X_both, y, grp):
     clf = lgb.LGBMClassifier(**lgb_params)
     clf.fit(X_both.iloc[tr], y.iloc[tr])
     proba = clf.predict_proba(X_both.iloc[te])[:, 1]
-    aucs.append(roc_auc_score(y.iloc[te], proba))
+    mod_folds.append(roc_auc_score(y.iloc[te], proba))
     feat_imp += clf.booster_.feature_importance(importance_type="gain")
-print("Multimodal AUC:", round(np.mean(aucs), 3))
 
-# ---------- 8. Stacking ensemble ----------
+mod_mean = np.mean(mod_folds)
+mod_ci = np.percentile(mod_folds, [2.5, 97.5])
+print(f"Multimodal AUC: {mod_mean:.3f} (95% CI: {mod_ci[0]:.3f}–{mod_ci[1]:.3f})")
+
+# ---------- 8. Stacking ensemble with CIs ----------
+# build OOF predictions
 oof = np.zeros((len(X_both), 3))
-for i, (cols, Xsub) in enumerate(
-    [
-        (X_eye.columns, X_eye),
-        (X_text.columns, X_text),
-        (X_both.columns, X_both),
-    ]
-):
+for i, Xsub in enumerate([X_eye, X_text, X_both]):
     for tr, te in cv.split(Xsub, y, grp):
         m = lgb.LGBMClassifier(**lgb_params)
         m.fit(Xsub.iloc[tr], y.iloc[tr])
         oof[te, i] = m.predict_proba(Xsub.iloc[te])[:, 1]
-meta = LogisticRegression(max_iter=1000).fit(oof, y)
-print("Stacked AUC:", round(roc_auc_score(y, meta.predict_proba(oof)[:, 1]), 3))
 
-# ---------- 9. Hyperparameter random search ----------
+# per-fold meta-AUC
+stacked_folds = []
+for tr, te in cv.split(oof, y, grp):
+    meta = LogisticRegression(max_iter=1000, solver="lbfgs")
+    meta.fit(oof[tr], y.iloc[tr])
+    pred = meta.predict_proba(oof[te])[:, 1]
+    stacked_folds.append(roc_auc_score(y.iloc[te], pred))
+
+stack_mean = np.mean(stacked_folds)
+stack_ci = np.percentile(stacked_folds, [2.5, 97.5])
+print(f"Stacked AUC: {stack_mean:.3f} (95% CI: {stack_ci[0]:.3f}–{stack_ci[1]:.3f})")
+
+# ---------- 9. Hyperparameter random search (optional) ----------
 param_grid = {
     "num_leaves": [15, 31, 63, 127],
     "max_depth": [-1, 5, 10, 15],
@@ -166,6 +188,7 @@ param_grid = {
 }
 best_auc, best_p = 0, None
 trials = random.sample(list(product(*param_grid.values())), 30)
+print("Running hyperparameter random search …")
 for nl, md, lr, ff in trials:
     p = lgb_params.copy()
     p.update(num_leaves=nl, max_depth=md, learning_rate=lr, feature_fraction=ff)
@@ -177,6 +200,7 @@ for nl, md, lr, ff in trials:
     auc = np.mean(tmp)
     if auc > best_auc:
         best_auc, best_p = auc, p.copy()
+
 print("Best tuned AUC:", round(best_auc, 3), "with params:", best_p)
 
 # ---------- 10. Feature importances ----------
